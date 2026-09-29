@@ -90,6 +90,6 @@ Program ended with exit code: 0
 ```
 
 ## Seguridad y Licencia
-Desarrollado bajo principios de seguridad de memoria estrictos. Este es un proyecto de investigación enfocado a optimización de motores de bases de datos vectoriales.
+* Desarrollado bajo principios de seguridad de memoria estrictos. Este es un proyecto de investigación enfocado a optimización de motores de bases de datos vectoriales.
 
-Distribuido bajo la Licencia MIT. Consulta el archivo `LICENSE` para más información.
+* Consulta el archivo `LICENSE` para más información.
