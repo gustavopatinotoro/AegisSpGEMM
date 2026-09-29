@@ -1,0 +1,56 @@
+# ==============================================================================
+# AegisSpGEMM - Strict Git Ignore Policy
+# ==============================================================================
+
+# 1. Xcode / macOS Environment
+.DS_Store
+.AppleDouble
+.LSOverride
+*.xcuserstate
+project.xcworkspace/
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.pbxuser
+
+# 2. Build Artifacts & Caches
+build/
+Build/
+*.o
+*.obj
+*.out
+*.dylib
+*.a
+*.so
+*.swp
+*~.nib
+
+# 3. Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# 4. Machine Learning Models & Heavy Data (CRITICAL FOR 8GB LIMITS)
+# Under no circumstances should tensor weights or vector databases be committed.
+*.mlmodelc
+*.safetensors
+*.hdf5
+*.h5
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.parquet
+*.csv
+/datasets/
+/models/
+
+# 5. Profiling & Telemetry Logs
+*.trace
+*.crash
+*.log
+/Instruments/
