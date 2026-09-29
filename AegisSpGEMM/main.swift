@@ -2,99 +2,74 @@
 //  main.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 4 - Stress Testing (1 Million Nodes).
-//  Strict Memory Standard: DARPA Simulation and Telemetry Runner.
+//  Created for Phase 5 - Telemetry & Academic Profiling.
+//  Strict Memory Standard: P99, Recall and UMA Bandwidth validation.
 //
 
 import Foundation
 
 print("=========================================================")
-print("      AegisSpGEMM Engine - EXTREME STRESS TEST           ")
+print("  AegisSpGEMM Engine - ACADEMIC TELEMETRY SUITE (PHASE 5)")
 print("===================================================gapt\n")
 
 do {
-    // 1. Configuración de la Carga Útil (Payload)
-    let totalNodes = 1_000_000   // 1 Millón de Nodos
-    let vectorDimension = 384    // MiniLM standard
-    let edgesPerNode = 32        // Topología HNSW M=32
+    let totalNodes = 10_000
+    let vectorDimension = 128
+    let edgesPerNode = 32
     
-    print("[System] Configurando simulación: \(totalNodes) nodos, \(vectorDimension) dims, \(edgesPerNode) aristas/nodo.")
-    print("[System] Memoria UMA proyectada: ~1.66 GB. Iniciando generador sintético...\n")
+    print("[System] Generando entorno de validación (10k Nodos, 128 Dims)...")
     
-    let genStartTime = CFAbsoluteTimeGetCurrent()
-    
-    // 2. Pre-asignación Estricta (Prevención de fragmentación de RAM)
     var simulatedAdjacency = [[Int32]](repeating: [], count: totalNodes)
     var simulatedVectors = [[Float]](repeating: [], count: totalNodes)
     
-    // Generación de la "Aguja en el Pajar" (El vector de consulta)
-    var queryVector = [Float]()
-    queryVector.reserveCapacity(vectorDimension)
-    for _ in 0..<vectorDimension {
-        queryVector.append(Float.random(in: -1.0...1.0))
-    }
-    
-    // Llenado masivo (Simulación de un grafo aleatorio disperso)
+    // Generador Sintético Bidireccional Básico
     for i in 0..<totalNodes {
-        // Generar vector aleatorio
         var vec = [Float]()
         vec.reserveCapacity(vectorDimension)
-        for _ in 0..<vectorDimension {
-            vec.append(Float.random(in: -1.0...1.0))
-        }
+        for _ in 0..<vectorDimension { vec.append(Float.random(in: -1.0...1.0)) }
         simulatedVectors[i] = vec
         
-        // Generar conexiones aleatorias (simulando un "Small World" probabilístico)
-        // Nota: En un entorno aleatorio masivo bidireccional puro es costoso de generar en CPU,
-        // por lo que generamos conexiones salientes, la ley de grandes números garantiza
-        // que estadísticamente habrá recolección (Gather) suficiente en el SpMV.
         var edges = [Int32]()
         edges.reserveCapacity(edgesPerNode)
-        for _ in 0..<edgesPerNode {
-            edges.append(Int32.random(in: 0..<Int32(totalNodes)))
-        }
+        for _ in 0..<edgesPerNode { edges.append(Int32.random(in: 0..<Int32(totalNodes))) }
         simulatedAdjacency[i] = edges
     }
     
-    // INYECCIÓN DE CONTROL: Se Planta una coincidencia perfecta en el Nodo 999,999
-    // y lo conectamos a la semilla (Nodo 0) para asegurar que la ruta topológica exista.
-    simulatedVectors[999_999] = queryVector // Similitud Coseno máxima garantizada
-    simulatedAdjacency[999_999].append(0)   // 999,999 mira al 0
-    simulatedAdjacency[0].append(999_999)   // 0 mira al 999,999
+    // Asegurar conectividad en el nodo semilla (0)
+    simulatedAdjacency[0] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    for i in 1...10 { simulatedAdjacency[i].append(0) }
     
-    let genElapsed = CFAbsoluteTimeGetCurrent() - genStartTime
-    print(String(format: "[Simulation] Grafo sintético masivo generado en %.2f segundos.\n", genElapsed))
-    
-    // 3. Inicialización del Orquestador
-    print("[System] Inicializando Subsistemas Metal...")
     let orchestrator = try SearchOrchestrator()
+    try orchestrator.ingestIndex(adjacencyList: simulatedAdjacency, denseVectors: simulatedVectors, vectorDim: vectorDimension)
     
-    // 4. Ingestión y Compilación a la Memoria Unificada
-    try orchestrator.ingestIndex(
-        adjacencyList: simulatedAdjacency,
-        denseVectors: simulatedVectors,
-        vectorDim: vectorDimension
-    )
-    print("")
-    
-    // 5. Ejecución del Kernel en GPU (La verdadera prueba de estrés)
-    let entryPointNode = 0
-    let topK_Results = 3
-    
-    print("[GPU-Dispatch] Despachando \(totalNodes) vectores a la GPU...")
-    let results = try orchestrator.executeSearch(queryVector: queryVector, entryPoint: entryPointNode, topK: topK_Results)
-    
-    print("\n=========================================================")
-    print("      RESULTADOS TOP-K OBTENIDOS DESDE EL SILICIO          ")
-    print("=====================================================gapt\n")
-    for (rank, result) in results.enumerated() {
-        let formattedScore = String(format: "%.4f", result.score)
-        print(" Rank \(rank + 1): Nodo [\(result.nodeId)] | Similitud Métrica: \(formattedScore)")
+    // Generar Lote de Consultas (Batch)
+    let numQueries = 1_000
+    var batchQueries = [[Float]]()
+    batchQueries.reserveCapacity(numQueries)
+    for _ in 0..<numQueries {
+        var q = [Float]()
+        q.reserveCapacity(vectorDimension)
+        for _ in 0..<vectorDimension { q.append(Float.random(in: -1.0...1.0)) }
+        batchQueries.append(q)
     }
     
+    // Desactivar logs de ejecución individual en el Orchestrator
+    print("\n[Telemetry] Despachando ráfaga de \(numQueries) queries a la GPU...")
+    
+    let suite = BenchmarkSuite(orchestrator: orchestrator, vectors: simulatedVectors, adjacency: simulatedAdjacency)
+    let report = try suite.runAcademicBenchmark(queries: batchQueries, entryPoint: 0, topK: 5)
+    
+    print("\n=========================================================")
+    print("               REPORTE ACADÉMICO DE RENDIMIENTO            ")
+    print("=======================================================gapt")
+    print(String(format: " Recall@5 (Exactitud) : %.2f%%", report.recallTopK))
+    print(String(format: " Latencia Promedio    : %.4f ms", report.avgLatencyMs))
+    print(String(format: " Percentil P95        : %.4f ms", report.p95LatencyMs))
+    print(String(format: " Percentil P99        : %.4f ms", report.p99LatencyMs))
+    print(String(format: " Dispatch Overhead    : %.6f ms / query", report.dispatchOverheadMs))
+    print(String(format: " Ancho de Banda (UMA) : %.2f GB/s", report.effectiveBandwidthGBs))
+    print("========================================================gapt")
+    
 } catch {
-    print("\n[CRITICAL FAILURE] El motor abortó:")
-    print(error)
+    print("[CRITICAL FAILURE] \(error)")
 }
-
-print("\n[System] Secuencia finalizada. Liberando 1.6GB de Memoria UMA...")
