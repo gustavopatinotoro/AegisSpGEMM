@@ -25,6 +25,14 @@ El motor fue desarrollado bajo un protocolo estricto de aislamiento por fases:
 - 📂 **`Shaders/` (Phase 3):** Aceleradores matemáticos en `Metal (C++14)`. Contiene los Kernels paralelos que difunden la activación topológica y calculan la Similitud Coseno Condicional (Dot Product).
 - 📂 **`Pipeline/` (Phase 4):** Orquestador híbrido que actúa como fachada (Facade) integrando ingesta, compilación, despacho en GPU y post-procesamiento en CPU (Extracción de Top-K).
 
+## 🏛️ A Hombros de Gigantes (Fundamentos Teóricos)
+
+Esta arquitectura no surge del vacío; **Aegis-SpGEMM** se construye sobre décadas de investigación fundamental en ciencias de la computación y álgebra lineal aplicada:
+
+* **Estructuras de Recuperación (1960):** El trabajo pionero de **Edward Fredkin** con la invención del *Trie* (árbol de prefijos) [Trie Memory - ACM](https://dl.acm.org/doi/epdf/10.1145/367390.367400), que sentó las bases algorítmicas para el almacenamiento de memoria estructurada y la recuperación eficiente de información (Information Retrieval).
+* **Redes de Pequeños Mundos y HNSW:** La revolucionaria investigación de **Yu. A. Malkov y D. A. Yashunin** [HNSW - IEEE](https://ieeexplore.ieee.org/document/8594636), quienes llevaron el concepto de los "Pequeños Mundos" al espacio vectorial creando *Hierarchical Navigable Small World (HNSW)*. Su demostración matemática de cómo los grafos probabilísticos multicapa pueden buscar en miles de millones de dimensiones inspiró directamente la topología del sistema.
+* **Aceleración por Matrices Dispersas (Google Research):** El trabajo de Google con el algoritmo **ScaNN** [ScaNN](https://research.google/blog/announcing-scann-efficient-vector-similarity-search/) y proyectos como **STATIC** [Vectorizing the Trie](https://arxiv.org/pdf/2602.22647), que demostraron empíricamente cómo las topologías complejas pueden aplanarse y resolverse masivamente en paralelo utilizando *Sparse Matrices*, validando el uso de SpGEMM como un reemplazo superior al *Pointer-Chasing* en hardware moderno.
+
 ## Requisitos del Entorno
 
 - **Hardware:** Mac con procesador Apple Silicon (M1, M2, M3, M4...). Arquitectura de memoria unificada requerida.
