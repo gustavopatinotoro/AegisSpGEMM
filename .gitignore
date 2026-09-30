@@ -54,3 +54,5 @@ Package.resolved
 *.crash
 *.log
 /Instruments/
+data/*.bin
+Data/*.bin
