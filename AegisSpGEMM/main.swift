@@ -2,15 +2,15 @@
 //  main.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 6 - IVF-CSR Validation.
-//  Strict Memory Standard: CPU-GPU Hybrid Execution (Coarse + Fine Search).
+//  Created for Phase 7.1 - Compacted Execution Validation.
+//  Strict Memory Standard: Stream Compaction Verification (Sub-3ms target).
 //
 
 import Foundation
 
 print("=========================================================")
-print("  AegisSpGEMM Engine - PHASE 6 (IVF-CSR VALIDATION)      ")
-print("=========================================================\n")
+print("  AegisSpGEMM Engine - PHASE 7.1 (COMPACTED SILICON)     ")
+print("===================================================gapt\n")
 
 do {
     let sourceFileURL = URL(fileURLWithPath: #filePath)
@@ -37,42 +37,43 @@ do {
     
     let batchSize = 10
     let topKSearch = 10
-    let nprobe = 16 // Exploraremos ~1,800 candidatos topológicamente óptimos
+    let nprobe = 16
     
-    print("\n[Hybrid-Dispatch] Procesando \(batchSize) consultas (nprobe = \(nprobe))...")
+    print("\n[Hybrid-Dispatch] Procesando \(batchSize) consultas con Stream Compaction...")
     
     var totalRecall = 0.0
-    var totalLatency = 0.0
+    var totalLatencyMs = 0.0
+    var totalCpuMs = 0.0
+    var totalGpuMs = 0.0
     
     for i in 0..<batchSize {
         let query = dataset.queries[i]
         let expectedGT = dataset.groundTruth[i]
         
-        let start = CFAbsoluteTimeGetCurrent()
+        let cpuStart = CFAbsoluteTimeGetCurrent()
+        let winningCentroids = orchestrator.selectTopCentroids(
+            queryVector: query,
+            centroids: dataset.centroids,
+            nprobe: nprobe
+        )
+        let cpuEnd = CFAbsoluteTimeGetCurrent()
         
-        // Fase 1 (CPU): Enrutamiento Grueso
-        var centroidScores = [(index: Int, score: Float)]()
-        centroidScores.reserveCapacity(dataset.numCentroids)
+        let gpuStart = CFAbsoluteTimeGetCurrent()
+        let results = try orchestrator.executeSearch(
+            queryVector: query,
+            entryPoints: winningCentroids,
+            topK: topKSearch
+        )
+        let gpuEnd = CFAbsoluteTimeGetCurrent()
         
-        for (cIdx, centroid) in dataset.centroids.enumerated() {
-            var score: Float = 0.0
-            for d in 0..<dataset.dimension {
-                score += query[d] * centroid[d]
-            }
-            centroidScores.append((cIdx, score))
-        }
+        let cpuMs = (cpuEnd - cpuStart) * 1000.0
+        let gpuMs = (gpuEnd - gpuStart) * 1000.0
+        let totalQueryMs = cpuMs + gpuMs
         
-        centroidScores.sort { $0.score > $1.score }
-        let winningCentroids = centroidScores.prefix(nprobe).map { $0.index }
+        totalCpuMs += cpuMs
+        totalGpuMs += gpuMs
+        totalLatencyMs += totalQueryMs
         
-        // Fase 2 (GPU): Búsqueda Fina Masiva
-        let results = try orchestrator.executeSearch(queryVector: query, entryPoints: winningCentroids, topK: topKSearch)
-        
-        let end = CFAbsoluteTimeGetCurrent()
-        let latencyMs = (end - start) * 1000.0
-        totalLatency += latencyMs
-        
-        // Calcular Recall
         let resultIds = results.map { $0.nodeId }
         let expectedTopK = Array(expectedGT.prefix(topKSearch))
         let intersection = Set(resultIds).intersection(Set(expectedTopK))
@@ -80,14 +81,16 @@ do {
         
         totalRecall += queryRecall
         
-        print(String(format: " ↳ Query %02d | Latencia: %6.3f ms | Recall: %d/%d (%.0f%%)",
-                     i+1, latencyMs, intersection.count, topKSearch, queryRecall * 100.0))
+        print(String(format: " ↳ Query %02d | Total: %6.3f ms (CPU Union: %5.3f ms | GPU Compact: %5.3f ms) | Recall: %d/%d (%.0f%%)",
+                     i + 1, totalQueryMs, cpuMs, gpuMs, intersection.count, topKSearch, queryRecall * 100.0))
     }
     
     print("\n=========================================================")
-    print(String(format: " ⏱️ Latencia Promedio (CPU+GPU) : %.4f ms", totalLatency / Double(batchSize)))
-    print(String(format: " 📈 Recall Promedio (@%d)       : %.2f%%", topKSearch, (totalRecall / Double(batchSize)) * 100.0))
-    print("=========================================================")
+    print(String(format: " Latencia CPU (Union Posting) : %.4f ms", totalCpuMs / Double(batchSize)))
+    print(String(format: " Latencia GPU (Compact SIMD)  : %.4f ms", totalGpuMs / Double(batchSize)))
+    print(String(format: " Latencia Total Promedio      : %.4f ms", totalLatencyMs / Double(batchSize)))
+    print(String(format: " Recall Promedio (@%d)         : %.2f%%", topKSearch, (totalRecall / Double(batchSize)) * 100.0))
+    print("======================================================gapt")
     
 } catch {
     print("[CRITICAL FAILURE] \(error)")
