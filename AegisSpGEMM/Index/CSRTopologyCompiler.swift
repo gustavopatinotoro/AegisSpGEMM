@@ -2,21 +2,24 @@
 //  CSRTopologyCompiler.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 6 - IVF-CSR Compiler.
-//  Strict Memory Standard: Native CSR bridging to UMA without CPU pointer-chasing.
+//  Created for Phase 7.1 - Compacted Candidate Compiler.
+//  Strict Memory Standard: Native CSR bridging with optimized candidate scratchpads.
 //
 
 import Foundation
 import Metal
 
-/// @class CSRTopologyCompiler
-/// @brief Motor de compilación *Ahead-of-Time* (AoT). Transfiere el CSR nativo a memoria unificada.
 public final class CSRTopologyCompiler {
     
     private let memoryManager: UMAMemoryManager
+    private let device: MTLDevice
     
     public init() throws {
         self.memoryManager = UMAMemoryManager()
+        guard let defaultDevice = MTLCreateSystemDefaultDevice() else {
+            throw CSRCompilationError.hardwareBridgingFailed("Dispositivo Metal no disponible.")
+        }
+        self.device = defaultDevice
     }
     
     public func compileToUMA(
@@ -30,18 +33,16 @@ public final class CSRTopologyCompiler {
         let numVectors = denseVectors.count
         let totalEdges = colIdx.count
         
-        guard numVectors > 0, numCentroids > 0 else {
-            throw CSRCompilationError.invalidGraphTopology("El dataset IVF está vacío.")
+        guard numVectors > 0, numCentroids > 0, vectorDim > 0 else {
+            throw CSRCompilationError.invalidGraphTopology("Dimensiones inválidas en el dataset IVF-CSR.")
         }
         
-        // Aplanar los vectores para la GPU (Contiguous Array)
         var flattenedVectors = [Float]()
         flattenedVectors.reserveCapacity(numVectors * vectorDim)
         for vector in denseVectors {
             flattenedVectors.append(contentsOf: vector)
         }
         
-        // Traspaso Zero-Copy al Hardware (Vía Objective-C++)
         guard let rowPointersUMA = rowPtr.withUnsafeBufferPointer({ ptr in
             memoryManager.allocateCSRRowPointers(ptr.baseAddress!, count: UInt(rowPtr.count))
         }) else {
@@ -60,10 +61,27 @@ public final class CSRTopologyCompiler {
             throw CSRCompilationError.outOfMemory("Fallo al asignar denseVectors UMA.")
         }
         
+        // Scratchpad dimensionado para hasta 16,000 candidatos simultáneos en el peor caso
+        let maxCandidates = 16_000
+        let candidateBytes = maxCandidates * MemoryLayout<Int32>.stride
+        let resultsBytes = maxCandidates * MemoryLayout<Float>.stride
+        let queryBytes = vectorDim * MemoryLayout<Float>.stride
+        
+        guard let queryUMA = device.makeBuffer(length: queryBytes, options: .storageModeShared),
+              let candidateIndicesUMA = device.makeBuffer(length: candidateBytes, options: .storageModeShared),
+              let resultsUMA = device.makeBuffer(length: resultsBytes, options: .storageModeShared) else {
+            throw CSRCompilationError.outOfMemory("Fallo al pre-asignar el Scratchpad compacto en UMA.")
+        }
+        
         return CSRHardwareContext(
             rowPointersBuffer: rowPointersUMA,
             colIndicesBuffer: colIndicesUMA,
             denseVectorsBuffer: vectorsUMA,
+            rowPtr: rowPtr,
+            colIdx: colIdx,
+            queryBuffer: queryUMA,
+            candidateIndicesBuffer: candidateIndicesUMA,
+            resultsBuffer: resultsUMA,
             numVectors: numVectors,
             numCentroids: numCentroids,
             vectorDim: vectorDim,
