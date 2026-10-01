@@ -2,8 +2,8 @@
 //  SearchOrchestrator.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 7.1 (Updated Phase 8 - Heterogeneous ANE + AMX + Metal UMA Orchestrator).
-//  Strict Memory Standard: Zero-Allocation Hot Loop & Adaptive Nucleus Probing.
+//  Created for Phase 7.1 (Updated Phase 8.1 - Calibrated ANE + AMX + Metal UMA Orchestrator).
+//  Strict Memory Standard: Zero-Allocation Hot Loop & Entropy-Boosted Nucleus Probing.
 //
 
 import Foundation
@@ -60,12 +60,12 @@ public final class SearchOrchestrator {
         print("[Aegis-Telemetry] Vectores: \(context.numVectors) | Centroides: \(context.numCentroids) | Dim: \(context.vectorDim) | MaxCandidates UMA: \(context.maxCandidates)")
     }
     
-    /// @brief Conecta y compila el modelo CoreML (.mlpackage o .mlmodelc) en el Apple Neural Engine (ANE).
+    /// @brief Conecta, compila y calienta (Warm-up) el modelo CoreML (.mlpackage o .mlmodelc) en el ANE.
     public func loadANERouter(from modelURL: URL) throws {
         guard let context = self.hardwareContext else {
             throw MetalEngineError.pipelineCreationFailed("Debes ingerir el índice en la UMA antes de inicializar el ANE Router.")
         }
-        print("[ANE-Info] Compilando e inyectando '\(modelURL.lastPathComponent)' en el Apple Neural Engine...")
+        print("[ANE-Info] Compilando y ejecutando Warm-up de '\(modelURL.lastPathComponent)' en el Apple Neural Engine...")
         let start = CFAbsoluteTimeGetCurrent()
         self.aneRouter = try ANENeuralRouter(
             modelURL: modelURL,
@@ -73,7 +73,7 @@ public final class SearchOrchestrator {
             numCentroids: context.numCentroids
         )
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
-        print(String(format: "[ANE-Success] Enrutador Neuronal ANE online en %.2f ms (ComputeUnits: .cpuAndNeuralEngine).", elapsed))
+        print(String(format: "[ANE-Success] Enrutador Neuronal ANE online y caliente en %.2f ms (ComputeUnits: .cpuAndNeuralEngine).", elapsed))
     }
     
     /// @brief Enrutamiento Grueso Estático ejecutado en un único despacho matricial AMX (`vDSP_mmul`).
@@ -112,14 +112,14 @@ public final class SearchOrchestrator {
         return centroidScores.prefix(nprobe).map { $0.index }
     }
     
-    /// @brief Enrutamiento Neuronal Adaptativo (Fase 8): Usa el ANE si el .mlpackage está presente,
-    /// o ejecuta un respaldo de Softmax con Temperatura en el coprocesador AMX.
+    /// @brief Enrutamiento Neuronal Adaptativo Calibrado (Fase 8.1): Usa el ANE si el .mlpackage está presente,
+    /// o ejecuta el respaldo vectorizado Softmax con Temperatura en el coprocesador AMX.
     public func selectTopCentroidsAdaptive(
         queryVector: [Float],
-        confidenceThreshold: Float = 0.965,
+        confidenceThreshold: Float = 0.985,
         minProbe: Int = 10,
-        maxProbe: Int = 28,
-        fallbackTemperature: Float = 15.0
+        maxProbe: Int = 32,
+        fallbackTemperature: Float = 11.0
     ) throws -> AdaptiveRoutingDecision {
         
         // 1. Camino Primario: Inferencia Física en el Apple Neural Engine (ANE)
@@ -132,8 +132,7 @@ public final class SearchOrchestrator {
             )
         }
         
-        // 2. Camino de Respaldo (Si aún no se ha copiado AegisNeuralRouter.mlpackage):
-        // Calcula logits en AMX (vDSP_mmul) y aplica Softmax con temperatura para distribución de probabilidad
+        // 2. Camino de Respaldo Vectorizado en AMX (vDSP_mmul + vDSP_vsmul)
         guard let context = self.hardwareContext else {
             throw MetalEngineError.pipelineCreationFailed("El índice no ha sido ingerido en la UMA.")
         }
@@ -156,14 +155,11 @@ public final class SearchOrchestrator {
             )
         }
         
+        var temp = fallbackTemperature
+        vDSP_vsmul(scoresPtr, 1, &temp, scoresPtr, 1, vDSP_Length(numCentroids))
+        
         var maxLogit: Float = -Float.infinity
-        for i in 0..<numCentroids {
-            let scaled = scoresPtr[i] * fallbackTemperature
-            scoresPtr[i] = scaled
-            if scaled > maxLogit {
-                maxLogit = scaled
-            }
-        }
+        vDSP_maxv(scoresPtr, 1, &maxLogit, vDSP_Length(numCentroids))
         
         var probs = [Float](repeating: 0.0, count: numCentroids)
         var sumExp: Float = 0.0
@@ -173,10 +169,8 @@ public final class SearchOrchestrator {
             sumExp += e
         }
         
-        let invSum = sumExp > 0 ? (1.0 / sumExp) : 1.0
-        for i in 0..<numCentroids {
-            probs[i] *= invSum
-        }
+        var invSum = sumExp > 0 ? (1.0 / sumExp) : 1.0
+        vDSP_vsmul(probs, 1, &invSum, &probs, 1, vDSP_Length(numCentroids))
         
         return ANENeuralRouter.computeNucleusProbing(
             probabilities: probs,
