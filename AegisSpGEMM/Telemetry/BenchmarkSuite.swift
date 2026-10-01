@@ -2,8 +2,8 @@
 //  BenchmarkSuite.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 7.1 (Updated Phase 8 - Adaptive ANE & Static AMX Benchmark Suite).
-//  Strict Memory Standard: P95/P99 Latency, Adaptive Probe Profiling & Bandwidth Telemetry.
+//  Created for Phase 7.1 (Updated Phase 8.1 - True End-to-End P95/P99 & Silicon Bandwidth Suite).
+//  Strict Memory Standard: Exact Per-Query Total Latency Distribution & Adaptive Probe Profiling.
 //
 
 import Foundation
@@ -12,12 +12,15 @@ import Accelerate
 public struct BenchmarkReport {
     public let totalQueries: Int
     public let recallTopK: Double
-    public let p95LatencyMs: Double
-    public let p99LatencyMs: Double
-    public let avgLatencyMs: Double
+    public let p50TotalLatencyMs: Double
+    public let p95TotalLatencyMs: Double
+    public let p99TotalLatencyMs: Double
+    public let avgTotalLatencyMs: Double
+    public let coarseRoutingAvgMs: Double
+    public let avgGpuWallMs: Double
     public let avgGpuSiliconMs: Double
     public let effectiveBandwidthGBs: Double
-    public let coarseRoutingAvgMs: Double
+    public let siliconBandwidthGBs: Double
     public let avgNprobeUsed: Double
 }
 
@@ -52,24 +55,21 @@ public final class BenchmarkSuite {
         
         guard !queries.isEmpty, numVectors > 0, vectorDim > 0 else {
             return BenchmarkReport(
-                totalQueries: 0,
-                recallTopK: 0.0,
-                p95LatencyMs: 0.0,
-                p99LatencyMs: 0.0,
-                avgLatencyMs: 0.0,
-                avgGpuSiliconMs: 0.0,
-                effectiveBandwidthGBs: 0.0,
-                coarseRoutingAvgMs: 0.0,
+                totalQueries: 0, recallTopK: 0.0,
+                p50TotalLatencyMs: 0.0, p95TotalLatencyMs: 0.0, p99TotalLatencyMs: 0.0,
+                avgTotalLatencyMs: 0.0, coarseRoutingAvgMs: 0.0, avgGpuWallMs: 0.0,
+                avgGpuSiliconMs: 0.0, effectiveBandwidthGBs: 0.0, siliconBandwidthGBs: 0.0,
                 avgNprobeUsed: 0.0
             )
         }
         
-        var latencies = [Double]()
-        latencies.reserveCapacity(queries.count)
+        var totalLatencies = [Double]()
+        totalLatencies.reserveCapacity(queries.count)
         
         var totalRecall: Double = 0.0
         var recallSamplesCount: Int = 0
-        var totalCoarseRoutingSeconds: Double = 0.0
+        var totalCoarseRoutingMs: Double = 0.0
+        var totalGpuWallMs: Double = 0.0
         var totalGpuSiliconMs: Double = 0.0
         var totalBytesRead: Int = 0
         
@@ -80,7 +80,8 @@ public final class BenchmarkSuite {
                 nprobe: nprobe
             )
             let prepEnd = CFAbsoluteTimeGetCurrent()
-            totalCoarseRoutingSeconds += (prepEnd - prepStart)
+            let routeMs = (prepEnd - prepStart) * 1000.0
+            totalCoarseRoutingMs += routeMs
             
             var nnzTouched = 0
             for cIdx in winningCentroids {
@@ -97,9 +98,12 @@ public final class BenchmarkSuite {
             )
             let execEnd = CFAbsoluteTimeGetCurrent()
             
-            let queryLatencyMs = (execEnd - execStart) * 1000.0
-            latencies.append(queryLatencyMs)
+            let gpuWallMs = (execEnd - execStart) * 1000.0
+            let queryTotalMs = routeMs + gpuWallMs
+            
+            totalGpuWallMs += gpuWallMs
             totalGpuSiliconMs += orchestrator.lastGpuSiliconMs
+            totalLatencies.append(queryTotalMs)
             
             let bytesThisQuery = (nnzTouched * MemoryLayout<Int32>.stride)
                 + (nnzTouched * vectorDim * MemoryLayout<Float>.stride)
@@ -122,58 +126,64 @@ public final class BenchmarkSuite {
             }
         }
         
-        latencies.sort()
-        let avgLatency = latencies.reduce(0, +) / Double(latencies.count)
-        let p95Index = min(max(Int(Double(latencies.count) * 0.95), 0), latencies.count - 1)
-        let p99Index = min(max(Int(Double(latencies.count) * 0.99), 0), latencies.count - 1)
+        totalLatencies.sort()
+        let count = Double(totalLatencies.count)
+        let avgTotal = totalLatencies.reduce(0, +) / count
+        let p50Idx = min(max(Int(count * 0.50), 0), totalLatencies.count - 1)
+        let p95Idx = min(max(Int(count * 0.95), 0), totalLatencies.count - 1)
+        let p99Idx = min(max(Int(count * 0.99), 0), totalLatencies.count - 1)
         
-        let totalTimeSeconds = latencies.reduce(0, +) / 1000.0
-        let effectiveBW = totalTimeSeconds > 0 ? (Double(totalBytesRead) / 1_000_000_000.0) / totalTimeSeconds : 0.0
+        let totalWallSeconds = totalGpuWallMs / 1000.0
+        let totalSiliconSeconds = totalGpuSiliconMs / 1000.0
+        let totalGigabytes = Double(totalBytesRead) / 1_000_000_000.0
+        
+        let effectiveBW = totalWallSeconds > 0 ? totalGigabytes / totalWallSeconds : 0.0
+        let siliconBW = totalSiliconSeconds > 0 ? totalGigabytes / totalSiliconSeconds : 0.0
         let avgRecall = recallSamplesCount > 0 ? (totalRecall / Double(recallSamplesCount)) : 0.0
         
         return BenchmarkReport(
             totalQueries: queries.count,
             recallTopK: avgRecall * 100.0,
-            p95LatencyMs: latencies[p95Index],
-            p99LatencyMs: latencies[p99Index],
-            avgLatencyMs: avgLatency,
-            avgGpuSiliconMs: totalGpuSiliconMs / Double(queries.count),
+            p50TotalLatencyMs: totalLatencies[p50Idx],
+            p95TotalLatencyMs: totalLatencies[p95Idx],
+            p99TotalLatencyMs: totalLatencies[p99Idx],
+            avgTotalLatencyMs: avgTotal,
+            coarseRoutingAvgMs: totalCoarseRoutingMs / count,
+            avgGpuWallMs: totalGpuWallMs / count,
+            avgGpuSiliconMs: totalGpuSiliconMs / count,
             effectiveBandwidthGBs: effectiveBW,
-            coarseRoutingAvgMs: (totalCoarseRoutingSeconds / Double(queries.count)) * 1000.0,
+            siliconBandwidthGBs: siliconBW,
             avgNprobeUsed: Double(nprobe)
         )
     }
     
-    /// @brief Ejecuta el benchmark utilizando el Enrutador Neuronal Adaptativo (ANE / Nucleus Probing).
+    /// @brief Ejecuta el benchmark estadístico con el Enrutador Neuronal Adaptativo (ANE / Nucleus Probing).
     public func runAdaptiveAcademicBenchmark(
         queries: [[Float]],
         groundTruth: [[Int]]? = nil,
-        confidenceThreshold: Float = 0.965,
+        confidenceThreshold: Float = 0.985,
         minProbe: Int = 10,
-        maxProbe: Int = 28,
+        maxProbe: Int = 32,
         topK: Int = 10
     ) throws -> BenchmarkReport {
         
         guard !queries.isEmpty, numVectors > 0, vectorDim > 0 else {
             return BenchmarkReport(
-                totalQueries: 0,
-                recallTopK: 0.0,
-                p95LatencyMs: 0.0,
-                p99LatencyMs: 0.0,
-                avgLatencyMs: 0.0,
-                avgGpuSiliconMs: 0.0,
-                effectiveBandwidthGBs: 0.0,
-                coarseRoutingAvgMs: 0.0,
+                totalQueries: 0, recallTopK: 0.0,
+                p50TotalLatencyMs: 0.0, p95TotalLatencyMs: 0.0, p99TotalLatencyMs: 0.0,
+                avgTotalLatencyMs: 0.0, coarseRoutingAvgMs: 0.0, avgGpuWallMs: 0.0,
+                avgGpuSiliconMs: 0.0, effectiveBandwidthGBs: 0.0, siliconBandwidthGBs: 0.0,
                 avgNprobeUsed: 0.0
             )
         }
         
-        var latencies = [Double]()
-        latencies.reserveCapacity(queries.count)
+        var totalLatencies = [Double]()
+        totalLatencies.reserveCapacity(queries.count)
         
         var totalRecall: Double = 0.0
         var recallSamplesCount: Int = 0
         var totalCoarseRoutingMs: Double = 0.0
+        var totalGpuWallMs: Double = 0.0
         var totalGpuSiliconMs: Double = 0.0
         var totalBytesRead: Int = 0
         var totalProbesUsed: Int = 0
@@ -185,7 +195,8 @@ public final class BenchmarkSuite {
                 minProbe: minProbe,
                 maxProbe: maxProbe
             )
-            totalCoarseRoutingMs += decision.latencyMs
+            let routeMs = decision.latencyMs
+            totalCoarseRoutingMs += routeMs
             totalProbesUsed += decision.adaptiveNprobe
             
             var nnzTouched = 0
@@ -203,9 +214,12 @@ public final class BenchmarkSuite {
             )
             let execEnd = CFAbsoluteTimeGetCurrent()
             
-            let queryLatencyMs = (execEnd - execStart) * 1000.0
-            latencies.append(queryLatencyMs)
+            let gpuWallMs = (execEnd - execStart) * 1000.0
+            let queryTotalMs = routeMs + gpuWallMs
+            
+            totalGpuWallMs += gpuWallMs
             totalGpuSiliconMs += orchestrator.lastGpuSiliconMs
+            totalLatencies.append(queryTotalMs)
             
             let bytesThisQuery = (nnzTouched * MemoryLayout<Int32>.stride)
                 + (nnzTouched * vectorDim * MemoryLayout<Float>.stride)
@@ -228,25 +242,34 @@ public final class BenchmarkSuite {
             }
         }
         
-        latencies.sort()
-        let avgLatency = latencies.reduce(0, +) / Double(latencies.count)
-        let p95Index = min(max(Int(Double(latencies.count) * 0.95), 0), latencies.count - 1)
-        let p99Index = min(max(Int(Double(latencies.count) * 0.99), 0), latencies.count - 1)
+        totalLatencies.sort()
+        let count = Double(totalLatencies.count)
+        let avgTotal = totalLatencies.reduce(0, +) / count
+        let p50Idx = min(max(Int(count * 0.50), 0), totalLatencies.count - 1)
+        let p95Idx = min(max(Int(count * 0.95), 0), totalLatencies.count - 1)
+        let p99Idx = min(max(Int(count * 0.99), 0), totalLatencies.count - 1)
         
-        let totalTimeSeconds = latencies.reduce(0, +) / 1000.0
-        let effectiveBW = totalTimeSeconds > 0 ? (Double(totalBytesRead) / 1_000_000_000.0) / totalTimeSeconds : 0.0
+        let totalWallSeconds = totalGpuWallMs / 1000.0
+        let totalSiliconSeconds = totalGpuSiliconMs / 1000.0
+        let totalGigabytes = Double(totalBytesRead) / 1_000_000_000.0
+        
+        let effectiveBW = totalWallSeconds > 0 ? totalGigabytes / totalWallSeconds : 0.0
+        let siliconBW = totalSiliconSeconds > 0 ? totalGigabytes / totalSiliconSeconds : 0.0
         let avgRecall = recallSamplesCount > 0 ? (totalRecall / Double(recallSamplesCount)) : 0.0
         
         return BenchmarkReport(
             totalQueries: queries.count,
             recallTopK: avgRecall * 100.0,
-            p95LatencyMs: latencies[p95Index],
-            p99LatencyMs: latencies[p99Index],
-            avgLatencyMs: avgLatency,
-            avgGpuSiliconMs: totalGpuSiliconMs / Double(queries.count),
+            p50TotalLatencyMs: totalLatencies[p50Idx],
+            p95TotalLatencyMs: totalLatencies[p95Idx],
+            p99TotalLatencyMs: totalLatencies[p99Idx],
+            avgTotalLatencyMs: avgTotal,
+            coarseRoutingAvgMs: totalCoarseRoutingMs / count,
+            avgGpuWallMs: totalGpuWallMs / count,
+            avgGpuSiliconMs: totalGpuSiliconMs / count,
             effectiveBandwidthGBs: effectiveBW,
-            coarseRoutingAvgMs: totalCoarseRoutingMs / Double(queries.count),
-            avgNprobeUsed: Double(totalProbesUsed) / Double(queries.count)
+            siliconBandwidthGBs: siliconBW,
+            avgNprobeUsed: Double(totalProbesUsed) / count
         )
     }
     

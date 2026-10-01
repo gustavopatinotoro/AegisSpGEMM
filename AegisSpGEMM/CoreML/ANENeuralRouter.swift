@@ -2,8 +2,8 @@
 //  ANENeuralRouter.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 8 - ANE Learned Coarse Router & Adaptive Nucleus Probing.
-//  Strict Memory Standard: Pre-allocated MLMultiArray Scratchpad & .cpuAndNeuralEngine Isolation.
+//  Created for Phase 8 (Updated Phase 8.1 - Zero-Allocation Scratchpad & Continuous Entropy Law).
+//  Strict Memory Standard: Pre-allocated Input/Output Buffers & .cpuAndNeuralEngine Isolation.
 //
 
 import Foundation
@@ -28,11 +28,12 @@ public struct AdaptiveRoutingDecision {
 }
 
 /// @class ANENeuralRouter
-/// @brief Enrutador neuronal para el Apple Neural Engine (ANE) con selección dinámica de celdas (Nucleus Probing).
+/// @brief Enrutador neuronal para el Apple Neural Engine (ANE) con control híbrido Masa + Entropía.
 public final class ANENeuralRouter {
     
     private let model: MLModel
     private let inputTensor: MLMultiArray
+    private var probabilitiesScratchpad: [Float]
     private let inputFeatureName: String
     private let outputFeatureName: String
     private let vectorDim: Int
@@ -49,12 +50,13 @@ public final class ANENeuralRouter {
         self.numCentroids = numCentroids
         self.inputFeatureName = inputFeatureName
         self.outputFeatureName = outputFeatureName
+        self.probabilitiesScratchpad = [Float](repeating: 0.0, count: numCentroids)
         
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw ANERouterError.modelNotFound("No se encontró el modelo CoreML en: \(modelURL.path)")
         }
         
-        // 1. Aislar el cómputo en el ANE (Prohibido tocar la GPU reservada para Metal SpGEMM)
+        // 1. Aislar el cómputo en el ANE (Dejar 100% de la GPU libre para Metal SpGEMM)
         let config = MLModelConfiguration()
         config.computeUnits = .cpuAndNeuralEngine
         config.allowLowPrecisionAccumulationOnGPU = true
@@ -69,7 +71,7 @@ public final class ANENeuralRouter {
         
         self.model = try MLModel(contentsOf: compiledURL, configuration: config)
         
-        // 3. Scratchpad MLMultiArray [1, vectorDim] pre-asignado (Zero-Allocation en bucle caliente)
+        // 3. Scratchpad MLMultiArray [1, vectorDim] pre-asignado (Zero-Allocation)
         guard let multiArray = try? MLMultiArray(
             shape: [1, NSNumber(value: vectorDim)],
             dataType: .float32
@@ -77,13 +79,31 @@ public final class ANENeuralRouter {
             throw ANERouterError.invalidTensorAllocation
         }
         self.inputTensor = multiArray
+        
+        // 4. Calentamiento Físico del Silicio ANE (Despierta el demonio 'aned' antes del benchmark)
+        try performHardwareWarmup()
     }
     
-    /// @brief Ejecuta la inferencia en el ANE y aplica Nucleus Probing (masa acumulada >= confidenceThreshold).
+    /// @brief Ejecuta 3 inferencias en vacío durante la carga para mapear los registros SRAM del ANE.
+    private func performHardwareWarmup() throws {
+        let ptr = inputTensor.dataPointer.bindMemory(to: Float.self, capacity: vectorDim)
+        let normVal = 1.0 / Float(sqrt(Double(vectorDim)))
+        for i in 0..<vectorDim {
+            ptr[i] = normVal
+        }
+        let provider = try MLDictionaryFeatureProvider(
+            dictionary: [inputFeatureName: MLFeatureValue(multiArray: inputTensor)]
+        )
+        for _ in 0..<3 {
+            _ = try model.prediction(from: provider)
+        }
+    }
+    
+    /// @brief Ejecuta la inferencia en el ANE y aplica la Ley de Control Híbrida (Masa + Entropía).
     public func routeAdaptively(
         queryVector: [Float],
-        confidenceThreshold: Float = 0.965,
-        minProbe: Int = 8,
+        confidenceThreshold: Float = 0.985,
+        minProbe: Int = 10,
         maxProbe: Int = 32
     ) throws -> AdaptiveRoutingDecision {
         
@@ -107,32 +127,32 @@ public final class ANENeuralRouter {
             throw ANERouterError.predictionFailed("El modelo CoreML no devolvió el tensor '\(outputFeatureName)'.")
         }
         
-        // 3. Lectura directa de probabilidades y aplicación de Nucleus Probing
+        // 3. Lectura directa sobre el Scratchpad pre-asignado (Cero asignaciones en Heap)
         let count = min(numCentroids, outputMultiArray.count)
-        var probabilities = [Float](repeating: 0.0, count: count)
-        
         if outputMultiArray.dataType == .float32 {
             let probPtr = outputMultiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
-            memcpy(&probabilities, probPtr, count * MemoryLayout<Float>.stride)
+            probabilitiesScratchpad.withUnsafeMutableBufferPointer { dstBuf in
+                if let dstBase = dstBuf.baseAddress {
+                    memcpy(dstBase, probPtr, count * MemoryLayout<Float>.stride)
+                }
+            }
         } else {
             for i in 0..<count {
-                probabilities[i] = outputMultiArray[i].floatValue
+                probabilitiesScratchpad[i] = outputMultiArray[i].floatValue
             }
         }
         
-        let decision = Self.computeNucleusProbing(
-            probabilities: probabilities,
+        return Self.computeNucleusProbing(
+            probabilities: probabilitiesScratchpad,
             confidenceThreshold: confidenceThreshold,
             minProbe: minProbe,
             maxProbe: maxProbe,
             startTime: startTime,
             usedHardwareANE: true
         )
-        
-        return decision
     }
     
-    /// @brief Algoritmo universal de selección adaptativa por masa acumulada y entropía de Shannon.
+    /// @brief Ley de Control Híbrida Fase 8.1: Combina Masa Acumulada con Rampa Continua por Entropía H_32.
     public static func computeNucleusProbing(
         probabilities: [Float],
         confidenceThreshold: Float,
@@ -154,23 +174,38 @@ public final class ANENeuralRouter {
         
         indexedProbs.sort { $0.prob > $1.prob }
         
+        // 1. Calcular Entropía de Cola sobre las primeras 32 celdas (H_32)
+        let entropyWindow = min(32, count)
+        var tailEntropy: Float = 0.0
+        for i in 0..<entropyWindow {
+            let p = max(indexedProbs[i].prob, 1e-9)
+            tailEntropy -= p * log(p)
+        }
+        
+        // 2. Rampa Continua de Entropía:
+        // - Consultas certeras (H_32 <= 0.25): Piso mínimo = safeMin (10 celdas).
+        // - Consultas intermedias y de frontera (H_32 > 0.25): Crecimiento proporcional continuo.
+        let entropyFloor: Int
+        if tailEntropy <= 0.25 {
+            entropyFloor = safeMin
+        } else {
+            let boost = Int(ceil((tailEntropy - 0.25) * 12.0))
+            entropyFloor = min(safeMax, safeMin + boost)
+        }
+        
+        // 3. Selección del núcleo acumulado respetando el piso de entropía
         var cumulativeMass: Float = 0.0
-        var entropy: Float = 0.0
         var chosenCount = 0
         var selected = [Int]()
         selected.reserveCapacity(safeMax)
         
-        for (i, item) in indexedProbs.enumerated() {
-            let p = max(item.prob, 1e-9)
+        for i in 0..<safeMax {
+            let item = indexedProbs[i]
             cumulativeMass += item.prob
-            entropy -= p * log(p)
             selected.append(item.index)
             chosenCount = i + 1
             
-            if chosenCount >= safeMin && cumulativeMass >= confidenceThreshold {
-                break
-            }
-            if chosenCount >= safeMax {
+            if chosenCount >= entropyFloor && cumulativeMass >= confidenceThreshold {
                 break
             }
         }
@@ -181,7 +216,7 @@ public final class ANENeuralRouter {
             selectedCentroids: selected,
             adaptiveNprobe: chosenCount,
             cumulativeConfidence: min(cumulativeMass, 1.0),
-            shannonEntropy: entropy,
+            shannonEntropy: tailEntropy,
             latencyMs: elapsedMs,
             usedHardwareANE: usedHardwareANE
         )
