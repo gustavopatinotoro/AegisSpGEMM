@@ -2,7 +2,7 @@
 //  BenchmarkSuite.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 7.1 - Compacted Benchmark Suite.
+//  Created for Phase 7.1 (Updated Phase 7.2 - Flat Tensor & Silicon Telemetry Suite).
 //  Strict Memory Standard: P95/P99 Latency and Compacted Bandwidth Profiling.
 //
 
@@ -15,6 +15,7 @@ public struct BenchmarkReport {
     public let p95LatencyMs: Double
     public let p99LatencyMs: Double
     public let avgLatencyMs: Double
+    public let avgGpuSiliconMs: Double
     public let effectiveBandwidthGBs: Double
     public let coarseRoutingAvgMs: Double
 }
@@ -22,19 +23,22 @@ public struct BenchmarkReport {
 public final class BenchmarkSuite {
     
     private let orchestrator: SearchOrchestrator
-    private let rawVectors: [[Float]]
-    private let centroids: [[Float]]
+    private let flattenedVectors: [Float]
+    private let numVectors: Int
+    private let vectorDim: Int
     private let rowPtr: [Int32]
     
     public init(
         orchestrator: SearchOrchestrator,
-        vectors: [[Float]],
-        centroids: [[Float]],
+        flattenedVectors: [Float],
+        numVectors: Int,
+        vectorDim: Int,
         rowPtr: [Int32]
     ) {
         self.orchestrator = orchestrator
-        self.rawVectors = vectors
-        self.centroids = centroids
+        self.flattenedVectors = flattenedVectors
+        self.numVectors = numVectors
+        self.vectorDim = vectorDim
         self.rowPtr = rowPtr
     }
     
@@ -45,22 +49,34 @@ public final class BenchmarkSuite {
         topK: Int = 10
     ) throws -> BenchmarkReport {
         
-        guard !queries.isEmpty, !rawVectors.isEmpty else {
-            return BenchmarkReport(totalQueries: 0, recallTopK: 0.0, p95LatencyMs: 0.0, p99LatencyMs: 0.0, avgLatencyMs: 0.0, effectiveBandwidthGBs: 0.0, coarseRoutingAvgMs: 0.0)
+        guard !queries.isEmpty, numVectors > 0, vectorDim > 0 else {
+            return BenchmarkReport(
+                totalQueries: 0,
+                recallTopK: 0.0,
+                p95LatencyMs: 0.0,
+                p99LatencyMs: 0.0,
+                avgLatencyMs: 0.0,
+                avgGpuSiliconMs: 0.0,
+                effectiveBandwidthGBs: 0.0,
+                coarseRoutingAvgMs: 0.0
+            )
         }
         
-        let vectorDim = rawVectors[0].count
         var latencies = [Double]()
         latencies.reserveCapacity(queries.count)
         
         var totalRecall: Double = 0.0
         var recallSamplesCount: Int = 0
         var totalCoarseRoutingSeconds: Double = 0.0
+        var totalGpuSiliconMs: Double = 0.0
         var totalBytesRead: Int = 0
         
         for (idx, query) in queries.enumerated() {
             let prepStart = CFAbsoluteTimeGetCurrent()
-            let winningCentroids = orchestrator.selectTopCentroids(queryVector: query, centroids: centroids, nprobe: nprobe)
+            let winningCentroids = try orchestrator.selectTopCentroids(
+                queryVector: query,
+                nprobe: nprobe
+            )
             let prepEnd = CFAbsoluteTimeGetCurrent()
             totalCoarseRoutingSeconds += (prepEnd - prepStart)
             
@@ -72,22 +88,34 @@ public final class BenchmarkSuite {
             }
             
             let execStart = CFAbsoluteTimeGetCurrent()
-            let gpuResults = try orchestrator.executeSearch(queryVector: query, entryPoints: winningCentroids, topK: topK)
+            let gpuResults = try orchestrator.executeSearch(
+                queryVector: query,
+                entryPoints: winningCentroids,
+                topK: topK
+            )
             let execEnd = CFAbsoluteTimeGetCurrent()
             
             let queryLatencyMs = (execEnd - execStart) * 1000.0
             latencies.append(queryLatencyMs)
+            totalGpuSiliconMs += orchestrator.lastGpuSiliconMs
             
-            let bytesThisQuery = (nnzTouched * MemoryLayout<Int32>.stride) + (nnzTouched * vectorDim * MemoryLayout<Float>.stride)
+            let bytesThisQuery = (nnzTouched * MemoryLayout<Int32>.stride)
+                + (nnzTouched * vectorDim * MemoryLayout<Float>.stride)
             totalBytesRead += bytesThisQuery
             
             if let gt = groundTruth, idx < gt.count {
                 let expectedTopK = Array(gt[idx].prefix(topK))
-                totalRecall += calculateRecall(gpuResults: gpuResults.map { $0.nodeId }, cpuResults: expectedTopK)
+                totalRecall += calculateRecall(
+                    gpuResults: gpuResults.map { $0.nodeId },
+                    cpuResults: expectedTopK
+                )
                 recallSamplesCount += 1
             } else if idx % 20 == 0 {
                 let cpuResults = computeGroundTruth(query: query, topK: topK)
-                totalRecall += calculateRecall(gpuResults: gpuResults.map { $0.nodeId }, cpuResults: cpuResults)
+                totalRecall += calculateRecall(
+                    gpuResults: gpuResults.map { $0.nodeId },
+                    cpuResults: cpuResults
+                )
                 recallSamplesCount += 1
             }
         }
@@ -107,31 +135,36 @@ public final class BenchmarkSuite {
             p95LatencyMs: latencies[p95Index],
             p99LatencyMs: latencies[p99Index],
             avgLatencyMs: avgLatency,
+            avgGpuSiliconMs: totalGpuSiliconMs / Double(queries.count),
             effectiveBandwidthGBs: effectiveBW,
             coarseRoutingAvgMs: (totalCoarseRoutingSeconds / Double(queries.count)) * 1000.0
         )
     }
     
     private func computeGroundTruth(query: [Float], topK: Int) -> [Int] {
-        let dim = vDSP_Length(query.count)
-        var scores = [(nodeId: Int, score: Float)]()
-        scores.reserveCapacity(rawVectors.count)
+        var allScores = [Float](repeating: 0.0, count: numVectors)
         
-        query.withUnsafeBufferPointer { qPtr in
-            guard let qBase = qPtr.baseAddress else { return }
-            for (id, vector) in rawVectors.enumerated() {
-                var dotProduct: Float = 0.0
-                vector.withUnsafeBufferPointer { vPtr in
-                    if let vBase = vPtr.baseAddress {
-                        vDSP_dotpr(qBase, 1, vBase, 1, &dotProduct, dim)
-                    }
-                }
-                scores.append((nodeId: id, score: dotProduct))
+        flattenedVectors.withUnsafeBufferPointer { vPtr in
+            query.withUnsafeBufferPointer { qPtr in
+                guard let vBase = vPtr.baseAddress, let qBase = qPtr.baseAddress else { return }
+                vDSP_mmul(
+                    vBase, 1,
+                    qBase, 1,
+                    &allScores, 1,
+                    vDSP_Length(numVectors),
+                    1,
+                    vDSP_Length(vectorDim)
+                )
             }
         }
         
-        scores.sort { $0.score > $1.score }
-        return Array(scores.prefix(topK)).map { $0.nodeId }
+        var scored = [(nodeId: Int, score: Float)]()
+        scored.reserveCapacity(numVectors)
+        for id in 0..<numVectors {
+            scored.append((nodeId: id, score: allScores[id]))
+        }
+        scored.sort { $0.score > $1.score }
+        return Array(scored.prefix(topK)).map { $0.nodeId }
     }
     
     private func calculateRecall(gpuResults: [Int], cpuResults: [Int]) -> Double {

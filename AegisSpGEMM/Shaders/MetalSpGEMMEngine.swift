@@ -2,8 +2,8 @@
 //  MetalSpGEMMEngine.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 7.1 - Zero-Copy Compacted Engine.
-//  Strict Memory Standard: Direct command encoding over compact candidate streams.
+//  Created for Phase 7.1 (Updated Phase 7.2 - Direct Scratchpad & Silicon Hardware Timers).
+//  Strict Memory Standard: Direct command encoding over pre-filled UMA candidate streams.
 //
 
 import Foundation
@@ -43,34 +43,27 @@ public final class MetalSpGEMMEngine {
         self.compactSimilarityPipelineState = try device.makeComputePipelineState(function: funcCompact)
     }
     
+    /// @brief Ejecuta el kernel compacto sobre los candidatos ya depositados en `context.candidateIndicesBuffer`.
+    /// @return Puntero Zero-Copy a los puntajes y tiempo puro de ejecución en silicio GPU (ms).
     public func executeCompactSearch(
         context: CSRHardwareContext,
         queryVector: [Float],
-        candidateIndices: [Int32]
-    ) throws -> UnsafeBufferPointer<Float> {
+        numCandidates: Int
+    ) throws -> (scores: UnsafeBufferPointer<Float>, gpuSiliconMs: Double) {
         
         guard queryVector.count == context.vectorDim else {
             throw MetalEngineError.pipelineCreationFailed("Dimensión de consulta incorrecta.")
         }
         
-        let numCandidates = candidateIndices.count
-        if numCandidates == 0 {
-            return UnsafeBufferPointer(start: nil, count: 0)
+        let safeCandidates = min(numCandidates, context.maxCandidates)
+        if safeCandidates <= 0 {
+            return (UnsafeBufferPointer(start: nil, count: 0), 0.0)
         }
         
         let queryBytes = context.vectorDim * MemoryLayout<Float>.stride
-        let candidateBytes = numCandidates * MemoryLayout<Int32>.stride
-        
-        // 1. Copiar consulta y candidatos compactos al scratchpad UMA
         queryVector.withUnsafeBytes { src in
             if let base = src.baseAddress {
                 memcpy(context.queryBuffer.contents(), base, queryBytes)
-            }
-        }
-        
-        candidateIndices.withUnsafeBytes { src in
-            if let base = src.baseAddress {
-                memcpy(context.candidateIndicesBuffer.contents(), base, candidateBytes)
             }
         }
         
@@ -84,10 +77,10 @@ public final class MetalSpGEMMEngine {
         
         let threadWidth = compactSimilarityPipelineState.threadExecutionWidth
         let threadsPerTG = MTLSize(width: threadWidth, height: 1, depth: 1)
-        let threadgroups = MTLSize(width: (numCandidates + threadWidth - 1) / threadWidth, height: 1, depth: 1)
+        let threadgroups = MTLSize(width: (safeCandidates + threadWidth - 1) / threadWidth, height: 1, depth: 1)
         
         var vDim = UInt32(context.vectorDim)
-        var nCand = UInt32(numCandidates)
+        var nCand = UInt32(safeCandidates)
         
         encoder.setComputePipelineState(compactSimilarityPipelineState)
         encoder.setBuffer(context.queryBuffer, offset: 0, index: 0)
@@ -103,7 +96,11 @@ public final class MetalSpGEMMEngine {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         
-        let rawPtr = context.resultsBuffer.contents().bindMemory(to: Float.self, capacity: numCandidates)
-        return UnsafeBufferPointer(start: rawPtr, count: numCandidates)
+        let gpuStart = commandBuffer.gpuStartTime
+        let gpuEnd = commandBuffer.gpuEndTime
+        let siliconMs = (gpuEnd > gpuStart && gpuStart > 0) ? (gpuEnd - gpuStart) * 1000.0 : 0.0
+        
+        let rawPtr = context.resultsBuffer.contents().bindMemory(to: Float.self, capacity: safeCandidates)
+        return (UnsafeBufferPointer(start: rawPtr, count: safeCandidates), siliconMs)
     }
 }
