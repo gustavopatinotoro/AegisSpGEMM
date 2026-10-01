@@ -56,3 +56,15 @@ Package.resolved
 /Instruments/
 data/*.bin
 Data/*.bin
+data/*.mlpackage
+Data/*.mlpackage
+data/*.mlmodelc
+Data/*.mlmodelc
+
+# Artefactos Binarios y Modelos CoreML (Cualquier nivel de subdirectorio)
+**/[Dd]ata/*.bin
+**/[Dd]ata/*.mlpackage/
+**/[Dd]ata/*.mlmodelc/
+*.bin
+*.mlpackage/
+*.mlmodelc/

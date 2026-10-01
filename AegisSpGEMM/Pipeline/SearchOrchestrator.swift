@@ -2,8 +2,8 @@
 //  SearchOrchestrator.swift
 //  AegisSpGEMM
 //
-//  Created for Phase 7.1 (Updated Phase 7.2 - AMX Matrix Routing & Direct UMA Slice Compaction).
-//  Strict Memory Standard: Zero-Allocation Hot Loop (No Set<Int32>, Single-Pass vDSP_mmul).
+//  Created for Phase 7.1 (Updated Phase 8 - Heterogeneous ANE + AMX + Metal UMA Orchestrator).
+//  Strict Memory Standard: Zero-Allocation Hot Loop & Adaptive Nucleus Probing.
 //
 
 import Foundation
@@ -15,14 +15,21 @@ public final class SearchOrchestrator {
     private let compiler: CSRTopologyCompiler
     private let gpuEngine: MetalSpGEMMEngine
     private var hardwareContext: CSRHardwareContext?
+    private var aneRouter: ANENeuralRouter?
     
     /// Tiempo físico puro de silicio GPU registrado en la última consulta (ms).
     public private(set) var lastGpuSiliconMs: Double = 0.0
+    
+    /// Indica si el modelo CoreML está cargado y activo en el Apple Neural Engine.
+    public var isANERouterLoaded: Bool {
+        return aneRouter != nil
+    }
     
     public init() throws {
         self.compiler = try CSRTopologyCompiler()
         self.gpuEngine = try MetalSpGEMMEngine()
         self.hardwareContext = nil
+        self.aneRouter = nil
     }
     
     public func ingestIndex(
@@ -53,7 +60,23 @@ public final class SearchOrchestrator {
         print("[Aegis-Telemetry] Vectores: \(context.numVectors) | Centroides: \(context.numCentroids) | Dim: \(context.vectorDim) | MaxCandidates UMA: \(context.maxCandidates)")
     }
     
-    /// @brief Enrutamiento Grueso ejecutado en un único despacho matricial AMX (`vDSP_mmul`).
+    /// @brief Conecta y compila el modelo CoreML (.mlpackage o .mlmodelc) en el Apple Neural Engine (ANE).
+    public func loadANERouter(from modelURL: URL) throws {
+        guard let context = self.hardwareContext else {
+            throw MetalEngineError.pipelineCreationFailed("Debes ingerir el índice en la UMA antes de inicializar el ANE Router.")
+        }
+        print("[ANE-Info] Compilando e inyectando '\(modelURL.lastPathComponent)' en el Apple Neural Engine...")
+        let start = CFAbsoluteTimeGetCurrent()
+        self.aneRouter = try ANENeuralRouter(
+            modelURL: modelURL,
+            vectorDim: context.vectorDim,
+            numCentroids: context.numCentroids
+        )
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+        print(String(format: "[ANE-Success] Enrutador Neuronal ANE online en %.2f ms (ComputeUnits: .cpuAndNeuralEngine).", elapsed))
+    }
+    
+    /// @brief Enrutamiento Grueso Estático ejecutado en un único despacho matricial AMX (`vDSP_mmul`).
     public func selectTopCentroids(
         queryVector: [Float],
         nprobe: Int
@@ -67,7 +90,6 @@ public final class SearchOrchestrator {
         let centroidsPtr = context.centroidsBuffer.contents().bindMemory(to: Float.self, capacity: numCentroids * dim)
         let scoresPtr = context.centroidScoresBuffer.contents().bindMemory(to: Float.self, capacity: numCentroids)
         
-        // Producto Matriz-Vector en un solo pase: [numCentroids x dim] * [dim x 1] = [numCentroids x 1]
         queryVector.withUnsafeBufferPointer { qPtr in
             guard let qBase = qPtr.baseAddress else { return }
             vDSP_mmul(
@@ -90,7 +112,83 @@ public final class SearchOrchestrator {
         return centroidScores.prefix(nprobe).map { $0.index }
     }
     
-    /// @brief Compacta las listas invertidas directamente en UMA vía `memcpy` (sin `Set<Int32>`) y lanza el kernel SIMD.
+    /// @brief Enrutamiento Neuronal Adaptativo (Fase 8): Usa el ANE si el .mlpackage está presente,
+    /// o ejecuta un respaldo de Softmax con Temperatura en el coprocesador AMX.
+    public func selectTopCentroidsAdaptive(
+        queryVector: [Float],
+        confidenceThreshold: Float = 0.965,
+        minProbe: Int = 10,
+        maxProbe: Int = 28,
+        fallbackTemperature: Float = 15.0
+    ) throws -> AdaptiveRoutingDecision {
+        
+        // 1. Camino Primario: Inferencia Física en el Apple Neural Engine (ANE)
+        if let router = self.aneRouter {
+            return try router.routeAdaptively(
+                queryVector: queryVector,
+                confidenceThreshold: confidenceThreshold,
+                minProbe: minProbe,
+                maxProbe: maxProbe
+            )
+        }
+        
+        // 2. Camino de Respaldo (Si aún no se ha copiado AegisNeuralRouter.mlpackage):
+        // Calcula logits en AMX (vDSP_mmul) y aplica Softmax con temperatura para distribución de probabilidad
+        guard let context = self.hardwareContext else {
+            throw MetalEngineError.pipelineCreationFailed("El índice no ha sido ingerido en la UMA.")
+        }
+        
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let numCentroids = context.numCentroids
+        let dim = context.vectorDim
+        let centroidsPtr = context.centroidsBuffer.contents().bindMemory(to: Float.self, capacity: numCentroids * dim)
+        let scoresPtr = context.centroidScoresBuffer.contents().bindMemory(to: Float.self, capacity: numCentroids)
+        
+        queryVector.withUnsafeBufferPointer { qPtr in
+            guard let qBase = qPtr.baseAddress else { return }
+            vDSP_mmul(
+                centroidsPtr, 1,
+                qBase, 1,
+                scoresPtr, 1,
+                vDSP_Length(numCentroids),
+                1,
+                vDSP_Length(dim)
+            )
+        }
+        
+        var maxLogit: Float = -Float.infinity
+        for i in 0..<numCentroids {
+            let scaled = scoresPtr[i] * fallbackTemperature
+            scoresPtr[i] = scaled
+            if scaled > maxLogit {
+                maxLogit = scaled
+            }
+        }
+        
+        var probs = [Float](repeating: 0.0, count: numCentroids)
+        var sumExp: Float = 0.0
+        for i in 0..<numCentroids {
+            let e = exp(scoresPtr[i] - maxLogit)
+            probs[i] = e
+            sumExp += e
+        }
+        
+        let invSum = sumExp > 0 ? (1.0 / sumExp) : 1.0
+        for i in 0..<numCentroids {
+            probs[i] *= invSum
+        }
+        
+        return ANENeuralRouter.computeNucleusProbing(
+            probabilities: probs,
+            confidenceThreshold: confidenceThreshold,
+            minProbe: minProbe,
+            maxProbe: maxProbe,
+            startTime: startTime,
+            usedHardwareANE: false
+        )
+    }
+    
+    /// @brief Compacta las listas invertidas directamente en UMA vía `memcpy` y lanza el kernel SIMD.
     public func executeSearch(
         queryVector: [Float],
         entryPoints: [Int],
@@ -106,7 +204,6 @@ public final class SearchOrchestrator {
         
         var totalCandidates = 0
         
-        // 1. Unión Disjunta Zero-Allocation: Copia directa de segmentos CSR contiguos hacia UMA
         context.colIdx.withUnsafeBufferPointer { colBuffer in
             guard let colBase = colBuffer.baseAddress else { return }
             for cIdx in entryPoints {
@@ -133,7 +230,6 @@ public final class SearchOrchestrator {
             }
         }
         
-        // 2. Despacho Compacto a la GPU
         let (scoresBuffer, siliconMs) = try gpuEngine.executeCompactSearch(
             context: context,
             queryVector: queryVector,
@@ -141,7 +237,6 @@ public final class SearchOrchestrator {
         )
         self.lastGpuSiliconMs = siliconMs
         
-        // 3. Extracción de Top-K leyendo directamente los punteros compartidos en UMA
         var scoredNodes = [(nodeId: Int, score: Float)]()
         scoredNodes.reserveCapacity(totalCandidates)
         
